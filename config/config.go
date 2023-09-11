@@ -28,25 +28,14 @@ import (
 
 // General config
 type General struct {
-	Inbound
+	LegacyInbound
 	Controller
-	Mode        T.TunnelMode `json:"mode"`
-	LogLevel    log.LogLevel `json:"log-level"`
-	IPv6        bool         `json:"ipv6"`
-	Interface   string       `json:"-"`
-	RoutingMark int          `json:"-"`
-}
-
-// Inbound
-type Inbound struct {
-	Port           int      `json:"port"`
-	SocksPort      int      `json:"socks-port"`
-	RedirPort      int      `json:"redir-port"`
-	TProxyPort     int      `json:"tproxy-port"`
-	MixedPort      int      `json:"mixed-port"`
-	Authentication []string `json:"authentication"`
-	AllowLan       bool     `json:"allow-lan"`
-	BindAddress    string   `json:"bind-address"`
+	Authentication []string     `json:"authentication"`
+	Mode           T.TunnelMode `json:"mode"`
+	LogLevel       log.LogLevel `json:"log-level"`
+	IPv6           bool         `json:"ipv6"`
+	Interface      string       `json:"-"`
+	RoutingMark    int          `json:"-"`
 }
 
 // Controller
@@ -54,6 +43,16 @@ type Controller struct {
 	ExternalController string `json:"-"`
 	ExternalUI         string `json:"-"`
 	Secret             string `json:"-"`
+}
+
+type LegacyInbound struct {
+	Port        int    `json:"port"`
+	SocksPort   int    `json:"socks-port"`
+	RedirPort   int    `json:"redir-port"`
+	TProxyPort  int    `json:"tproxy-port"`
+	MixedPort   int    `json:"mixed-port"`
+	AllowLan    bool   `json:"allow-lan"`
+	BindAddress string `json:"bind-address"`
 }
 
 // DNS config
@@ -69,6 +68,7 @@ type DNS struct {
 	FakeIPRange       *fakeip.Pool
 	Hosts             *trie.DomainTrie
 	NameServerPolicy  map[string]dns.NameServer
+	SearchDomains     []string
 }
 
 // FallbackFilter config
@@ -97,6 +97,7 @@ type Config struct {
 	Experimental *Experimental
 	Hosts        *trie.DomainTrie
 	Profile      *Profile
+	Inbounds     []C.Inbound
 	Rules        []C.Rule
 	Users        []auth.AuthUser
 	Proxies      map[string]C.Proxy
@@ -106,7 +107,7 @@ type Config struct {
 
 type RawDNS struct {
 	Enable            bool              `yaml:"enable"`
-	IPv6              bool              `yaml:"ipv6"`
+	IPv6              *bool             `yaml:"ipv6"`
 	UseHosts          bool              `yaml:"use-hosts"`
 	NameServer        []string          `yaml:"nameserver"`
 	Fallback          []string          `yaml:"fallback"`
@@ -117,6 +118,7 @@ type RawDNS struct {
 	FakeIPFilter      []string          `yaml:"fake-ip-filter"`
 	DefaultNameserver []string          `yaml:"default-nameserver"`
 	NameServerPolicy  map[string]string `yaml:"nameserver-policy"`
+	SearchDomains     []string          `yaml:"search-domains"`
 }
 
 type RawFallbackFilter struct {
@@ -205,6 +207,7 @@ type RawConfig struct {
 
 	ProxyProvider map[string]map[string]any `yaml:"proxy-providers"`
 	Hosts         map[string]string         `yaml:"hosts"`
+	Inbounds      []C.Inbound               `yaml:"inbounds"`
 	DNS           RawDNS                    `yaml:"dns"`
 	Experimental  Experimental              `yaml:"experimental"`
 	Profile       Profile                   `yaml:"profile"`
@@ -273,6 +276,8 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 	}
 	config.General = general
 
+	config.Inbounds = rawCfg.Inbounds
+
 	proxies, providers, err := parseProxies(rawCfg)
 	if err != nil {
 		return nil, err
@@ -324,7 +329,7 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
 	}
 
 	return &General{
-		Inbound: Inbound{
+		LegacyInbound: LegacyInbound{
 			Port:        cfg.Port,
 			SocksPort:   cfg.SocksPort,
 			RedirPort:   cfg.RedirPort,
@@ -564,7 +569,7 @@ func parseNameServer(servers []string) ([]dns.NameServer, error) {
 			addr, err = hostWithDefaultPort(u.Host, "853")
 			dnsNetType = "tcp-tls" // DNS over TLS
 		case "https":
-			clearURL := url.URL{Scheme: "https", Host: u.Host, Path: u.Path}
+			clearURL := url.URL{Scheme: "https", Host: u.Host, Path: u.Path, User: u.User}
 			addr = clearURL.String()
 			dnsNetType = "https" // DNS over HTTPS
 		case "dhcp":
@@ -630,7 +635,7 @@ func parseDNS(rawCfg *RawConfig, hosts *trie.DomainTrie) (*DNS, error) {
 	dnsCfg := &DNS{
 		Enable:       cfg.Enable,
 		Listen:       cfg.Listen,
-		IPv6:         cfg.IPv6,
+		IPv6:         lo.FromPtrOr(cfg.IPv6, rawCfg.IPv6),
 		EnhancedMode: cfg.EnhancedMode,
 		FallbackFilter: FallbackFilter{
 			IPCIDR: []*net.IPNet{},
@@ -700,6 +705,18 @@ func parseDNS(rawCfg *RawConfig, hosts *trie.DomainTrie) (*DNS, error) {
 
 	if cfg.UseHosts {
 		dnsCfg.Hosts = hosts
+	}
+
+	if len(cfg.SearchDomains) != 0 {
+		for _, domain := range cfg.SearchDomains {
+			if strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") {
+				return nil, errors.New("search domains should not start or end with '.'")
+			}
+			if strings.Contains(domain, ":") {
+				return nil, errors.New("search domains are for ipv4 only and should not contain ports")
+			}
+		}
+		dnsCfg.SearchDomains = cfg.SearchDomains
 	}
 
 	return dnsCfg, nil
